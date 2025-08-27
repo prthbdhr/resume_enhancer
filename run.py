@@ -15,14 +15,13 @@ logger = logging.getLogger(__name__)
 
 # Import core resume matcher logic
 from resume_matcher import ResumeKeywordMatcher
-# Import chatbot agents and response models
-from agent import ResumeAnalyzerChatbot, ChatResponse, ResumeEnhancerChatbot, ResumeExtractionAgent
+# Import chatbot agent and response models
+from agent import ResumeChatbot, ChatResponse
 
-# Global variables for matcher and chatbots
+# Global variables for matcher and chatbot
 matcher: Optional[ResumeKeywordMatcher] = None
-chatbot: Optional[ResumeAnalyzerChatbot] = None
-enhancer_chatbot: Optional[ResumeEnhancerChatbot] = None
-extraction_agent: Optional[ResumeExtractionAgent] = None
+chatbot: Optional[ResumeChatbot] = None
+
 
 # -----------------------------
 # Pydantic Response Models
@@ -43,10 +42,12 @@ class AnalysisResponse(BaseModel):
         description="ATS optimization analysis if requested"
     )
 
+
 class ErrorResponse(BaseModel):
     error: str
     message: str
     details: Optional[Dict[str, Any]] = None
+
 
 # -----------------------------
 # FastAPI App Initialization
@@ -54,26 +55,21 @@ class ErrorResponse(BaseModel):
 @asynccontextmanager
 async def lifespan_manager(app: FastAPI):
     """Initialize and clean up resources for the app lifecycle."""
-    global matcher, chatbot, enhancer_chatbot, extraction_agent
+    global matcher, chatbot
     try:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY environment variable not set")
+
         logger.info("Initializing ResumeKeywordMatcher...")
         matcher = ResumeKeywordMatcher(api_key)
-        logger.info("Initializing Resume Analyzer Chatbot...")
-        from agent import ResumeScorer
-        def scorer_func(resume_markdown, job_description):
-            scorer = ResumeScorer(api_key)
-            return scorer.analyze_resume(resume_markdown, job_description).dict()
-        chatbot = ResumeAnalyzerChatbot(
+
+        logger.info("Initializing Resume Chatbot...")
+        chatbot = ResumeChatbot(
             google_api_key=api_key,
-            existing_resume_tool_function=scorer_func
+            resume_matcher=matcher
         )
-        logger.info("Initializing Resume Enhancer Chatbot...")
-        enhancer_chatbot = ResumeEnhancerChatbot(google_api_key=api_key)
-        logger.info("Initializing Resume Extraction Agent...")
-        extraction_agent = ResumeExtractionAgent(google_api_key=api_key)
+
         logger.info("Service startup completed")
         yield
     except Exception as e:
@@ -81,6 +77,7 @@ async def lifespan_manager(app: FastAPI):
         raise
     finally:
         logger.info("Shutting down service")
+
 
 # Create FastAPI app with custom lifespan
 fastapi_app = FastAPI(
@@ -109,6 +106,7 @@ fastapi_app.add_middleware(
 # -----------------------------
 ALLOWED_FILE_TYPES = {'.pdf', '.docx', '.doc', '.txt'}
 MAX_FILE_SIZE_MB = 5
+
 
 # -----------------------------
 # API Endpoints
@@ -158,11 +156,12 @@ async def analyze_resume(
                 }
             )
         analysis = matcher.analyze_resume_vs_jd(resume_text, job_description)
-        
+
         # Ensure analysis has required fields
         if not isinstance(analysis, dict):
-            analysis = {"overall_match_score": 5.0, "matching_keywords": [], "missing_keywords": [], "strengths": [], "weaknesses": [], "section_analysis": {}}
-        
+            analysis = {"overall_match_score": 5.0, "matching_keywords": [], "missing_keywords": [], "strengths": [],
+                        "weaknesses": [], "section_analysis": {}}
+
         if "overall_match_score" not in analysis:
             analysis["overall_match_score"] = 5.0
         if "matching_keywords" not in analysis:
@@ -175,16 +174,10 @@ async def analyze_resume(
             analysis["weaknesses"] = []
         if "section_analysis" not in analysis:
             analysis["section_analysis"] = {}
-            
+
         recommendations = matcher.generate_recommendations(analysis, resume_text)
         ats_scan = None
-        # Temporarily disabled ATS scan due to method issues
-        # if include_ats_scan:
-        #     try:
-        #         ats_scan = {"ats_tips": matcher._get_ats_tips(resume_text)}
-        #     except Exception as e:
-        #         logger.warning(f"ATS scan failed: {str(e)}")
-        #         ats_scan = {"ats_tips": ["Use standard section headings", "Include relevant keywords", "Avoid complex formatting"]}
+
         processing_time = (datetime.now() - start_time).total_seconds() * 1000
         return AnalysisResponse(
             overall_score=analysis["overall_match_score"],
@@ -213,6 +206,7 @@ async def analyze_resume(
             }
         )
 
+
 @fastapi_app.get("/api/health")
 async def health_check():
     """Comprehensive health check endpoint."""
@@ -225,36 +219,6 @@ async def health_check():
         }
     }
 
-@fastapi_app.post("/api/extract-and-analyze", response_model=Dict[str, Any],
-                  responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def extract_and_analyze(
-    resume_file: UploadFile = File(..., description="Resume file (PDF, DOCX, or TXT)"),
-    job_description: str = Form(..., description="Job description text", min_length=50),
-    analyze_with_agent: bool = Form(True, description="Also analyze extracted text with analyzer agent")
-):
-    """
-    Extract resume text using LLM and (optionally) analyze it for the job description.
-    Returns extracted text and analysis.
-    """
-    try:
-        if not extraction_agent:
-            raise HTTPException(status_code=503, detail="Extraction agent service not available")
-        file_content = await resume_file.read()
-        extraction_result = extraction_agent.extract_and_analyze(file_content, resume_file.filename, job_description)
-        if analyze_with_agent and extraction_result.get("extracted_text"):
-            analysis = chatbot.resume_tool_function(extraction_result["extracted_text"], job_description)
-            extraction_result["full_analysis"] = analysis
-        return extraction_result
-    except Exception as e:
-        logger.error(f"Extraction/analysis error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "extract_analyze_error",
-                "message": "Failed to extract/analyze resume",
-                "details": str(e)
-            }
-        )
 
 # -----------------------------
 # Chat API Models
@@ -263,21 +227,25 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
 
+
 class ResumeAnalysisRequest(BaseModel):
     resume_markdown: str
     job_description: str
     session_id: str = "default"
 
-class EnhanceResumeChatRequest(BaseModel):
+
+class ResumeEnhanceRequest(BaseModel):
     message: str
     resume_markdown: str = ""
     session_id: str = "default"
+
 
 @fastapi_app.post("/api/chat", response_model=ChatResponse,
                   responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def chat_with_bot(request: ChatRequest):
     """
-    Chat with the resume analysis bot. Maintains session history.
+    Chat with the comprehensive resume analysis bot. Maintains session history.
+    Handles both JD-based analysis and general resume improvement.
     """
     try:
         if not chatbot:
@@ -298,6 +266,7 @@ async def chat_with_bot(request: ChatRequest):
                 "details": str(e)
             }
         )
+
 
 @fastapi_app.post("/api/analyze-with-chat", response_model=ChatResponse,
                   responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
@@ -329,34 +298,39 @@ async def analyze_resume_with_chat(request: ResumeAnalysisRequest):
             }
         )
 
-@fastapi_app.post("/api/enhance-resume-chat", response_model=ChatResponse,
+
+@fastapi_app.post("/api/enhance-resume", response_model=ChatResponse,
                   responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def enhance_resume_chat(request: EnhanceResumeChatRequest):
+async def enhance_resume(request: ResumeEnhanceRequest):
     """
-    Continuous resume enhancement chat with the AI resume coach.
+    Get general resume improvement suggestions through the chatbot.
     """
     try:
-        if not enhancer_chatbot:
-            raise HTTPException(status_code=503, detail="Enhancer chatbot service not available")
+        if not chatbot:
+            raise HTTPException(status_code=503, detail="Chatbot service not available")
+
+        # Format message to include resume content for enhancement
         user_message = request.message
         if request.resume_markdown:
             user_message = f"Resume Content:\n{request.resume_markdown}\n\n{request.message}"
-        response = enhancer_chatbot.chat(user_message, request.session_id)
+
+        response = chatbot.chat(user_message, request.session_id)
         return ChatResponse(
             response=response,
             session_id=request.session_id,
             processed_at=datetime.isoformat(datetime.now())
         )
     except Exception as e:
-        logger.error(f"Enhance chat error: {str(e)}", exc_info=True)
+        logger.error(f"Resume enhancement error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "enhance_chat_error",
-                "message": "Failed to process enhancement chat message",
+                "error": "enhancement_error",
+                "message": "Failed to process resume enhancement request",
                 "details": str(e)
             }
         )
+
 
 @fastapi_app.get("/")
 async def root():
@@ -377,12 +351,17 @@ async def root():
             "chat": {
                 "path": "/api/chat",
                 "methods": ["POST"],
-                "description": "Chat with resume analysis bot"
+                "description": "Chat with comprehensive resume analysis bot"
             },
             "analyze-with-chat": {
                 "path": "/api/analyze-with-chat",
                 "methods": ["POST"],
                 "description": "Direct resume analysis through chatbot"
+            },
+            "enhance-resume": {
+                "path": "/api/enhance-resume",
+                "methods": ["POST"],
+                "description": "General resume improvement suggestions"
             },
             "health": {
                 "path": "/api/health",
@@ -392,6 +371,7 @@ async def root():
         }
     }
 
+
 # -----------------------------
 # Main Entrypoint
 # -----------------------------
@@ -399,6 +379,7 @@ if __name__ == "__main__":
     import uvicorn
     import sys
     from dotenv import load_dotenv
+
     load_dotenv()
     port = int(os.getenv("PORT", 8000))
     for i, arg in enumerate(sys.argv):
